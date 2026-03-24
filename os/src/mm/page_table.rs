@@ -1,9 +1,11 @@
 //! Implementation of [`PageTableEntry`] and [`PageTable`].
 
 use super::{frame_alloc, FrameTracker, PhysPageNum, StepByOne, VirtAddr, VirtPageNum};
+use crate::config::PAGE_SIZE;
 use alloc::vec;
 use alloc::vec::Vec;
 use bitflags::*;
+use core::mem::MaybeUninit;
 
 bitflags! {
     /// page table entry flags
@@ -178,4 +180,146 @@ pub fn translated_byte_buffer(token: usize, ptr: *const u8, len: usize) -> Vec<&
         start = end_va.into();
     }
     v
+}
+
+fn checked_user_byte_buffers(
+    token: usize,
+    ptr: *const u8,
+    len: usize,
+    required_flags: PTEFlags,
+) -> Option<Vec<&'static mut [u8]>> {
+    if len == 0 {
+        return Some(Vec::new());
+    }
+    let page_table = PageTable::from_token(token);
+    let mut start = ptr as usize;
+    let end = start.checked_add(len)?;
+    if start != VirtAddr::from(start).0 || end != VirtAddr::from(end).0 {
+        return None;
+    }
+    let mut v = Vec::new();
+    while start < end {
+        let start_va = VirtAddr::from(start);
+        let mut vpn = start_va.floor();
+        let pte = page_table.translate(vpn)?;
+        if !pte.is_valid() || !pte.flags().contains(required_flags) {
+            return None;
+        }
+        let ppn = pte.ppn();
+        vpn.step();
+        let mut end_va: VirtAddr = vpn.into();
+        end_va = end_va.min(VirtAddr::from(end));
+        let slice_end = if end_va.page_offset() == 0 {
+            PAGE_SIZE
+        } else {
+            end_va.page_offset()
+        };
+        v.push(&mut ppn.get_bytes_array()[start_va.page_offset()..slice_end]);
+        start = end_va.into();
+    }
+    Some(v)
+}
+
+/// Copy bytes from user space into a kernel buffer after validating `R|U` permissions.
+///
+/// Returns `false` if any page in the range is unmapped, not user-accessible, or lacks read
+/// permission.
+pub fn copy_from_user(token: usize, ptr: *const u8, dst: &mut [u8]) -> bool {
+    let byte_buffers =
+        match checked_user_byte_buffers(token, ptr, dst.len(), PTEFlags::R | PTEFlags::U) {
+            Some(byte_buffers) => byte_buffers,
+            None => return false,
+        };
+    let mut copied = 0;
+    for buffer in byte_buffers {
+        let len = buffer.len();
+        dst[copied..copied + len].copy_from_slice(buffer);
+        copied += len;
+    }
+    true
+}
+
+/// Copy bytes from the kernel into user space after validating `W|U` permissions.
+///
+/// Returns `false` if any page in the destination range is unmapped, not user-accessible,
+/// or lacks write permission.
+pub fn copy_to_user(token: usize, ptr: *mut u8, data: &[u8]) -> bool {
+    let byte_buffers = match checked_user_byte_buffers(
+        token,
+        ptr as *const u8,
+        data.len(),
+        PTEFlags::W | PTEFlags::U,
+    ) {
+        Some(byte_buffers) => byte_buffers,
+        None => return false,
+    };
+    let mut copied = 0;
+    for buffer in byte_buffers {
+        let len = buffer.len();
+        buffer.copy_from_slice(&data[copied..copied + len]);
+        copied += len;
+    }
+    true
+}
+
+/// Read a single byte from user space.
+///
+/// Returns `None` if the address is not a readable user address.
+pub fn read_user_byte(token: usize, ptr: *const u8) -> Option<u8> {
+    let mut byte = [0u8; 1];
+    if copy_from_user(token, ptr, &mut byte) {
+        Some(byte[0])
+    } else {
+        None
+    }
+}
+
+/// Write a single byte into user space.
+///
+/// Returns `false` if the address is not a writable user address.
+pub fn write_user_byte(token: usize, ptr: *mut u8, data: u8) -> bool {
+    copy_to_user(token, ptr, core::slice::from_ref(&data))
+}
+
+
+/// Translate&Copy a immutable ptr[u8] array with LENGTH len to a immutable u8 Vec through page table to user space
+/// This function is used to save the data in the kernel to user space.
+#[allow(unused)]
+pub fn save_byte_to_user(token: usize, ptr: *mut u8, data: &[u8]) {
+    assert!(copy_to_user(token, ptr, data));
+}
+
+/// Load a sized data from user space to kernel space through page table, and return it.
+/// 
+/// Note: This function introduce additional copy
+#[allow(unused)]
+pub fn load_data_from_user<T: Sized>(token: usize, ptr: *const T) -> T {
+    let mut data = MaybeUninit::<T>::uninit();
+    let data_bytes = unsafe {
+        core::slice::from_raw_parts_mut(
+            data.as_mut_ptr() as *mut u8,
+            core::mem::size_of::<T>(),
+        )
+    };
+    assert!(copy_from_user(token, ptr as *const u8, data_bytes));
+    unsafe { data.assume_init() }
+}
+
+/// Save a sized value from kernel space to user space and report whether it succeeds.
+///
+/// This is the typed counterpart of [`copy_to_user`].
+pub fn copy_data_to_user<T: Sized>(token: usize, ptr: *mut T, data: &T) -> bool {
+    let byte_buffer = unsafe {
+        core::slice::from_raw_parts(
+            data as *const T as *const u8,
+            core::mem::size_of::<T>(),
+        )
+    };
+    copy_to_user(token, ptr as *mut u8, byte_buffer)
+}
+
+/// Save a sized data from kernel space to user space through page table.
+#[allow(unused)]
+pub fn save_data_to_user<T: Sized>(token: usize, ptr: *mut T, data: &T) {
+    assert!(copy_data_to_user(token, ptr, data));
 }

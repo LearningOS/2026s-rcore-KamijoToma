@@ -14,9 +14,12 @@ mod switch;
 #[allow(clippy::module_inception)]
 mod task;
 
+use core::cell::RefMut;
+
 use crate::loader::{get_app_data, get_num_app};
 use crate::sync::UPSafeCell;
 use crate::trap::TrapContext;
+use alloc::collections::btree_map::BTreeMap;
 use alloc::vec::Vec;
 use lazy_static::*;
 use switch::__switch;
@@ -133,6 +136,24 @@ impl TaskManager {
         inner.tasks[cur].change_program_brk(size)
     }
 
+    /// Map memory into the current task's address space.
+    ///
+    /// This is the task-manager entry used by `sys_mmap`.
+    pub fn mmap_current_task(&self, start: usize, len: usize, port: usize) -> bool {
+        let mut inner = self.inner.exclusive_access();
+        let cur = inner.current_task;
+        inner.tasks[cur].mmap(start, len, port)
+    }
+
+    /// Unmap memory from the current task's address space.
+    ///
+    /// This is the task-manager entry used by `sys_munmap`.
+    pub fn munmap_current_task(&self, start: usize, len: usize) -> bool {
+        let mut inner = self.inner.exclusive_access();
+        let cur = inner.current_task;
+        inner.tasks[cur].munmap(start, len)
+    }
+
     /// Switch current `Running` task to the task we have found,
     /// or there is no `Ready` task and we can exit with all applications completed
     fn run_next_task(&self) {
@@ -152,6 +173,13 @@ impl TaskManager {
         } else {
             panic!("All applications completed!");
         }
+    }
+
+    /// Get mutable reference to current task's syscall counter
+    pub fn get_current_task_syscall_counter(&self) -> RefMut<'_, BTreeMap<usize, usize>> {
+        let inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        RefMut::map(inner, |inner| &mut inner.tasks[current].syscall_counter)
     }
 }
 
@@ -201,4 +229,23 @@ pub fn current_trap_cx() -> &'static mut TrapContext {
 /// Change the current 'Running' task's program break
 pub fn change_program_brk(size: i32) -> Option<usize> {
     TASK_MANAGER.change_current_program_brk(size)
+}
+
+/// Map memory into the current task's address space.
+///
+/// This is the module-level wrapper around [`TaskManager::mmap_current_task`].
+pub fn mmap_current_task(start: usize, len: usize, port: usize) -> bool {
+    TASK_MANAGER.mmap_current_task(start, len, port)
+}
+
+/// Unmap memory from the current task's address space.
+///
+/// This is the module-level wrapper around [`TaskManager::munmap_current_task`].
+pub fn munmap_current_task(start: usize, len: usize) -> bool {
+    TASK_MANAGER.munmap_current_task(start, len)
+}
+
+/// Get mutable reference to current task's syscall counter
+pub fn current_task_syscall_counter() -> RefMut<'static, BTreeMap<usize, usize>> {
+    TASK_MANAGER.get_current_task_syscall_counter()
 }
