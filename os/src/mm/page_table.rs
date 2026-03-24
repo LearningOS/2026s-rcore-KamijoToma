@@ -1,5 +1,6 @@
 //! Implementation of [`PageTableEntry`] and [`PageTable`].
 use super::{frame_alloc, FrameTracker, PhysAddr, PhysPageNum, StepByOne, VirtAddr, VirtPageNum};
+use crate::config::PAGE_SIZE;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -181,6 +182,71 @@ pub fn translated_byte_buffer(token: usize, ptr: *const u8, len: usize) -> Vec<&
         start = end_va.into();
     }
     v
+}
+
+fn checked_user_byte_buffers(
+    token: usize,
+    ptr: *const u8,
+    len: usize,
+    required_flags: PTEFlags,
+) -> Option<Vec<&'static mut [u8]>> {
+    if len == 0 {
+        return Some(Vec::new());
+    }
+    let page_table = PageTable::from_token(token);
+    let mut start = ptr as usize;
+    let end = start.checked_add(len)?;
+    if start != VirtAddr::from(start).0 || end != VirtAddr::from(end).0 {
+        return None;
+    }
+    let mut v = Vec::new();
+    while start < end {
+        let start_va = VirtAddr::from(start);
+        let mut vpn = start_va.floor();
+        let pte = page_table.translate(vpn)?;
+        if !pte.is_valid() || !pte.flags().contains(required_flags) {
+            return None;
+        }
+        let ppn = pte.ppn();
+        vpn.step();
+        let mut end_va: VirtAddr = vpn.into();
+        end_va = end_va.min(VirtAddr::from(end));
+        let slice_end = if end_va.page_offset() == 0 {
+            PAGE_SIZE
+        } else {
+            end_va.page_offset()
+        };
+        v.push(&mut ppn.get_bytes_array()[start_va.page_offset()..slice_end]);
+        start = end_va.into();
+    }
+    Some(v)
+}
+
+fn copy_to_user(token: usize, ptr: *mut u8, data: &[u8]) -> bool {
+    let byte_buffers = match checked_user_byte_buffers(
+        token,
+        ptr as *const u8,
+        data.len(),
+        PTEFlags::W | PTEFlags::U,
+    ) {
+        Some(byte_buffers) => byte_buffers,
+        None => return false,
+    };
+    let mut copied = 0;
+    for buffer in byte_buffers {
+        let len = buffer.len();
+        buffer.copy_from_slice(&data[copied..copied + len]);
+        copied += len;
+    }
+    true
+}
+
+/// Save a sized value from kernel space to user space and report whether it succeeds.
+pub fn copy_data_to_user<T: Sized>(token: usize, ptr: *mut T, data: &T) -> bool {
+    let byte_buffer = unsafe {
+        core::slice::from_raw_parts(data as *const T as *const u8, core::mem::size_of::<T>())
+    };
+    copy_to_user(token, ptr as *mut u8, byte_buffer)
 }
 
 /// Translate&Copy a ptr[u8] array end with `\0` to a `String` Vec through page table

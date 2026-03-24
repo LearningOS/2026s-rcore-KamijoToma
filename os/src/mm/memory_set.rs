@@ -300,6 +300,142 @@ impl MemorySet {
             false
         }
     }
+
+    fn validate_range(
+        start: usize,
+        len: usize,
+        len_must_be_aligned: bool,
+    ) -> Option<(VirtPageNum, VirtPageNum)> {
+        if len == 0 || !VirtAddr::from(start).aligned() {
+            return None;
+        }
+        if len_must_be_aligned && len % PAGE_SIZE != 0 {
+            return None;
+        }
+        let end = start.checked_add(len)?;
+        if start != VirtAddr::from(start).0 || end != VirtAddr::from(end).0 {
+            return None;
+        }
+        if start >= TRAP_CONTEXT_BASE || end > TRAP_CONTEXT_BASE {
+            return None;
+        }
+        let start_vpn = VirtAddr::from(start).floor();
+        let end_vpn = if len_must_be_aligned {
+            VirtAddr::from(end).floor()
+        } else {
+            VirtAddr::from(end).ceil()
+        };
+        if start_vpn == end_vpn {
+            return None;
+        }
+        Some((start_vpn, end_vpn))
+    }
+
+    fn mmap_permission(port: usize) -> Option<MapPermission> {
+        if port == 0 || port & !0x7 != 0 {
+            return None;
+        }
+        let mut permission = MapPermission::U;
+        if port & 0x1 != 0 {
+            permission |= MapPermission::R;
+        }
+        if port & 0x2 != 0 {
+            permission |= MapPermission::W;
+        }
+        if port & 0x4 != 0 {
+            permission |= MapPermission::X;
+        }
+        Some(permission)
+    }
+
+    /// Create a user anonymous mapping backed by fresh frames.
+    pub fn mmap(&mut self, start: usize, len: usize, port: usize) -> bool {
+        let (start_vpn, end_vpn) = match Self::validate_range(start, len, false) {
+            Some(range) => range,
+            None => return false,
+        };
+        let permission = match Self::mmap_permission(port) {
+            Some(permission) => permission,
+            None => return false,
+        };
+        if self.areas.iter().any(|area| area.overlaps(start_vpn, end_vpn)) {
+            return false;
+        }
+        self.push(
+            MapArea::new(
+                start_vpn.into(),
+                end_vpn.into(),
+                MapType::Framed,
+                permission,
+            )
+            .into_mmap(),
+            None,
+        );
+        true
+    }
+
+    /// Remove a user anonymous mapping from the current address space.
+    pub fn munmap(&mut self, start: usize, len: usize) -> bool {
+        let (start_vpn, end_vpn) = match Self::validate_range(start, len, true) {
+            Some(range) => range,
+            None => return false,
+        };
+        for vpn in VPNRange::new(start_vpn, end_vpn) {
+            if !self
+                .areas
+                .iter()
+                .any(|area| area.is_mmap && area.contains_vpn(vpn))
+            {
+                return false;
+            }
+        }
+
+        let areas = core::mem::take(&mut self.areas);
+        let mut new_areas = Vec::with_capacity(areas.len() + 1);
+        for mut area in areas {
+            if !area.is_mmap || !area.overlaps(start_vpn, end_vpn) {
+                new_areas.push(area);
+                continue;
+            }
+
+            let area_start = area.vpn_range.get_start();
+            let area_end = area.vpn_range.get_end();
+            let overlap_start = if start_vpn > area_start {
+                start_vpn
+            } else {
+                area_start
+            };
+            let overlap_end = if end_vpn < area_end { end_vpn } else { area_end };
+
+            let mut middle_and_right = area.data_frames.split_off(&overlap_start);
+            let right_frames = middle_and_right.split_off(&overlap_end);
+            for vpn in VPNRange::new(overlap_start, overlap_end) {
+                self.page_table.unmap(vpn);
+            }
+
+            if area_start < overlap_start {
+                new_areas.push(MapArea {
+                    vpn_range: VPNRange::new(area_start, overlap_start),
+                    data_frames: area.data_frames,
+                    map_type: area.map_type,
+                    map_perm: area.map_perm,
+                    is_mmap: area.is_mmap,
+                });
+            }
+            drop(middle_and_right);
+            if overlap_end < area_end {
+                new_areas.push(MapArea {
+                    vpn_range: VPNRange::new(overlap_end, area_end),
+                    data_frames: right_frames,
+                    map_type: area.map_type,
+                    map_perm: area.map_perm,
+                    is_mmap: area.is_mmap,
+                });
+            }
+        }
+        self.areas = new_areas;
+        true
+    }
 }
 /// map area structure, controls a contiguous piece of virtual memory
 pub struct MapArea {
@@ -307,6 +443,7 @@ pub struct MapArea {
     data_frames: BTreeMap<VirtPageNum, FrameTracker>,
     map_type: MapType,
     map_perm: MapPermission,
+    is_mmap: bool,
 }
 
 impl MapArea {
@@ -323,7 +460,18 @@ impl MapArea {
             data_frames: BTreeMap::new(),
             map_type,
             map_perm,
+            is_mmap: false,
         }
+    }
+    fn into_mmap(mut self) -> Self {
+        self.is_mmap = true;
+        self
+    }
+    fn contains_vpn(&self, vpn: VirtPageNum) -> bool {
+        self.vpn_range.get_start() <= vpn && vpn < self.vpn_range.get_end()
+    }
+    fn overlaps(&self, start: VirtPageNum, end: VirtPageNum) -> bool {
+        self.vpn_range.get_start() < end && start < self.vpn_range.get_end()
     }
     pub fn from_another(another: &Self) -> Self {
         Self {
@@ -331,6 +479,7 @@ impl MapArea {
             data_frames: BTreeMap::new(),
             map_type: another.map_type,
             map_perm: another.map_perm,
+            is_mmap: another.is_mmap,
         }
     }
     pub fn map_one(&mut self, page_table: &mut PageTable, vpn: VirtPageNum) {
