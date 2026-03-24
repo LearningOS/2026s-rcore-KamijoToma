@@ -17,6 +17,8 @@ mod task;
 use crate::config::MAX_APP_NUM;
 use crate::loader::{get_num_app, init_app_cx};
 use crate::sync::UPSafeCell;
+use alloc::collections::BTreeMap;
+use core::cell::RefMut;
 use lazy_static::*;
 use switch::__switch;
 pub use task::{TaskControlBlock, TaskStatus};
@@ -51,10 +53,11 @@ lazy_static! {
     /// Global variable: TASK_MANAGER
     pub static ref TASK_MANAGER: TaskManager = {
         let num_app = get_num_app();
-        let mut tasks = [TaskControlBlock {
+        let mut tasks: [TaskControlBlock; MAX_APP_NUM] = core::array::from_fn(|_| TaskControlBlock {
             task_cx: TaskContext::zero_init(),
             task_status: TaskStatus::UnInit,
-        }; MAX_APP_NUM];
+            syscall_counter: BTreeMap::new(),
+        });
         for (i, task) in tasks.iter_mut().enumerate() {
             task.task_cx = TaskContext::goto_restore(init_app_cx(i));
             task.task_status = TaskStatus::Ready;
@@ -135,6 +138,13 @@ impl TaskManager {
             panic!("All applications completed!");
         }
     }
+
+    /// Get mutable reference to current task's syscall counter
+    pub fn get_current_task_syscall_counter(&self) -> RefMut<'_, BTreeMap<usize, usize>> {
+        let inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        RefMut::map(inner, |inner| &mut inner.tasks[current].syscall_counter)
+    }
 }
 
 /// Run the first task in task list.
@@ -142,7 +152,7 @@ pub fn run_first_task() {
     TASK_MANAGER.run_first_task();
 }
 
-/// Switch current `Running` task to the task we have found,
+/// Switch current `Running' task to the task we have found,
 /// or there is no `Ready` task and we can exit with all applications completed
 fn run_next_task() {
     TASK_MANAGER.run_next_task();
@@ -168,4 +178,9 @@ pub fn suspend_current_and_run_next() {
 pub fn exit_current_and_run_next() {
     mark_current_exited();
     run_next_task();
+}
+
+/// Get mutable reference to current task's syscall counter
+pub fn get_current_task_syscall_counter() -> RefMut<'static, BTreeMap<usize, usize>> {
+    TASK_MANAGER.get_current_task_syscall_counter()
 }
